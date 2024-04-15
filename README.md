@@ -16,7 +16,18 @@ The primary purpose of this project is to validate the feasibility of using beac
 - Beacon Broadcasting: Nodes periodically broadcast a custom beacon frame that includes a unique identifier and other relevant metadata.
 - Beacon Reception: Nodes listen for beacon frames and, upon receiving a frame with the expected parameters, process and acknowledge its receipt.
 - Acknowledgment via UDP: Nodes send an acknowledgment over UDP to the beacon's originator, confirming that the beacon was received. This acknowledgment includes the beacon's index, allowing the sender to verify that its broadcast was successful.
+- Master (leader) node election: via number of reported beacons within specific timeframe
 - Node Management: The system maintains a list of active nodes based on the beacons sent and received, adding and removing nodes based on their last seen activity.
+  
+## Decentralized Node Discovery and Election
+
+- Discovery Through Broadcasts: Each node broadcasts its presence using beacon frames, and these broadcasts don't carry detailed information about the network topology or the states of other nodes. This keeps the broadcast process simple and the overhead low.
+
+- Acknowledgment of Presence: Other nodes in the network listen for these broadcasts and respond with acknowledgments. This response is a simple way to indicate "visibility" or "reachability" between nodes.
+
+- Election Based on Visibility: The core of the election process is the acknowledgment count. A node that receives the highest number of acknowledgments from other nodes within a given time frame is considered to have the best network visibility. This node elects itself to perform a leadership role, assuming it can effectively communicate with the majority of the network.
+
+- Self-Election and Task Execution: Nodes continually monitor acknowledgment counts and compare them with their identifiers. When a node recognizes that it has the highest acknowledgment count, it elects itself as the leader and starts executing designated leader tasks. This could include aggregating data, making decisions affecting the network, or managing resource distribution.
 
 ## Network Setup
 
