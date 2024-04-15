@@ -1,8 +1,16 @@
 // A concept sketch for a Proof of Beacon election process.
 // https://github.com/invpe/ProofOfBacon
+
+// To render a nice LED for the leader
+#include <Adafruit_NeoPixel.h>
+#define ADA_PIN 27
+#define ADA_NUMPIXELS 1
+
+
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <vector>
+#include <map>
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "esp_log.h"
@@ -17,14 +25,20 @@ esp_err_t esp_wifi_80211_tx(wifi_interface_t ifx, const void* buffer, int len, b
 #define SUBTYPE_BEACONS 0x08
 #define NODE_MIN_BEACON_INTERVAL 10000
 #define NODE_TIMEOUT 60000
-#define NODE_BROADCAST 5000
+#define NODE_BROADCAST_UDP 5000
 #define MSG_TYPE_BEACON_RECEIVED 1
+#define MASTER_ELECTION_INTERVAL 60000
 
+// LED to show if we're leader
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(ADA_NUMPIXELS, ADA_PIN, NEO_GRB + NEO_KHZ800);
+
+//
 uint64_t uiLastUDPBroadcast = millis();
+uint64_t uiLastElectionTime = 0;
 
 // Network settings
-const char* ssid = "____WIFI____";
-const char* password = "___PASSWORD___";
+const char* ssid = "";
+const char* password = "";
 
 // UDP settings
 WiFiUDP udp;
@@ -38,6 +52,9 @@ struct Node {
   unsigned long lastSeen;
 };
 std::vector<Node> nodes;
+
+// Election
+std::map<String, int> ackCounts;  // Map to count acknowledgments per node
 
 // Helper structures
 struct frame_control {
@@ -81,7 +98,7 @@ struct tbeacon {
 };
 
 // Beacon election
-uint8_t uiBeaconConfirmed = 0;
+
 uint64_t uiNextBeacon = 0;
 uint64_t uiIdxBeacon = 0;
 
@@ -157,12 +174,18 @@ void promiscuous_rx_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
       udp.beginPacket(broadcastAddress, localUdpPort);
       udp.write((uint8_t*)message.c_str(), message.length());
       udp.endPacket();
+      
     }
   }
 }
 
 void setup() {
   Serial.begin(115200);
+
+  pixels.begin();
+  pixels.setPixelColor(0, 255, 0, 0);
+  pixels.setBrightness(255);
+  pixels.show();
 
   // Join WIFI
   WiFi.begin(ssid, password);
@@ -172,6 +195,9 @@ void setup() {
   }
   Serial.println("Connected to WiFi");
   Serial.println(WiFi.channel());
+
+  // Add ourselves to the nodes list
+  nodes.push_back({ WiFi.localIP(), millis() });
 
   // Enable Promisc
   esp_wifi_set_promiscuous(true);
@@ -234,26 +260,75 @@ void sendBeacon() {
     // Send the frame
     esp_err_t result = esp_wifi_80211_tx(WIFI_IF_STA, packet, packetSize, false);
 
-    Serial.println("Sending Beacon with index "+String(uiIdxBeacon));
+    Serial.println("Sending Beacon with index " + String(uiIdxBeacon));
 
     // Increase the internal beacon index
     uiIdxBeacon++;
-    uiBeaconConfirmed = 0;
 
-    // Set new beacon interval  
+    // Set new beacon interval
     uiNextBeacon = millis() + NODE_MIN_BEACON_INTERVAL + rand() % NODE_MIN_BEACON_INTERVAL;
   }
 }
+String GetMAC() {
+
+  uint8_t mac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+  // Format the MAC address
+  char macStr[18];
+  sprintf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr);
+}
+
+void electMaster() {
+  Serial.println("Election process");
+  int totalAcknowledgmentsReceived = 0;
+
+  // Sum all the acknowledgments received from other nodes
+  for (auto& count : ackCounts) {
+    totalAcknowledgmentsReceived += count.second;
+  }
+  // Calculate the dynamic threshold based on the number of discovered nodes
+  if (nodes.size() == 0) {
+
+  } else {
+
+    int thresholdToBecomeMaster = nodes.size() / 2;  // 50% of the nodes
+
+    // Determine if this node should be the master
+    // This might involve comparing totalAcknowledgmentsReceived to a threshold
+    // or comparing against acknowledgments received by peers if that info is available
+    if (totalAcknowledgmentsReceived >= thresholdToBecomeMaster) {
+      Serial.println("This node is now the master.");
+      pixels.setPixelColor(0, 0, 255, 0);
+      pixels.show();
+    } else {
+      Serial.println("This node is not the master.");
+      pixels.setPixelColor(0, 255, 0, 0);
+      pixels.show();
+    }
+  }
+  ackCounts.clear();
+}
+
 void loop() {
   sendBeacon();
   sendUDPBroadcast();
   listenForUDPBroadcasts();
+
+  // Perform election
+  if (millis() - uiLastElectionTime > MASTER_ELECTION_INTERVAL) {
+    electMaster();
+    uiLastElectionTime = millis();
+  }
+
+
   cleanNodeList();
 }
 
 // Send UDP Broadcast (Discovery)
 void sendUDPBroadcast() {
-  if (millis() - uiLastUDPBroadcast >= NODE_BROADCAST) {
+  if (millis() - uiLastUDPBroadcast >= NODE_BROADCAST_UDP) {
     udp.beginPacket(broadcastAddress, localUdpPort);
     udp.write((uint8_t*)strAnnouncement.c_str(), strAnnouncement.length());
     udp.endPacket();
@@ -304,45 +379,21 @@ std::vector<String> splitString(const String& str, char delimiter) {
 
 // Process messages incoming over udp
 void processUDPMessage(IPAddress ip, const String& message) {
-
-  // Split the message by commas
   std::vector<String> messageParts = splitString(message, ',');
 
-  if (messageParts.size() < 3) {
-    Serial.println("Invalid message format");
-    return;
-  }
+  if (messageParts.size() == 3) {
+    // Assuming message format is "1,MAC,Index"
+    int msgType = messageParts[0].toInt();
+    String macAddress = messageParts[1];
+    int beaconIndex = messageParts[2].toInt();
 
-  // Parse the message type
-  int msgType = messageParts[0].toInt();
-
-  // Handle the message based on its type
-  switch (msgType) {
-    case MSG_TYPE_BEACON_RECEIVED:
-      if (messageParts.size() == 3) {
-        
-        uint8_t mac[6];
-        esp_wifi_get_mac(WIFI_IF_STA, mac);
-        
-        // Format the MAC address
-        char macStr[18];
-        sprintf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]); 
-        String macString = String(macStr);
-
-        // Few checks:
-        // 1 - we check if the MAC is US
-        // 2 - we check if the index is the beacon index we've sent
-        // 3 - we check if the beacon was confirmed already
-        if (macString == messageParts[1] && uiIdxBeacon - 1 == messageParts[2].toInt() && uiBeaconConfirmed == 0) {
-          Serial.println("We have ACK on our beacon from " + ip.toString() + " Index " + messageParts[2]);
-          uiBeaconConfirmed = 1;
-        }
+    if (msgType == MSG_TYPE_BEACON_RECEIVED) {
+      if (GetMAC() == macAddress && uiIdxBeacon - 1 == beaconIndex) {
+        Serial.println("We have ACK on our beacon from " + ip.toString() + " Index " + messageParts[2]);
+        // Using IP address as key to count ACKs
+        ackCounts[ip.toString()]++;
       }
-      break;
-
-    default:
-      Serial.println("Unknown message type received from " + ip.toString());
-      break;
+    }
   }
 }
 
@@ -369,7 +420,8 @@ void updateNodeList(IPAddress ip) {
 void cleanNodeList() {
   auto it = nodes.begin();
   while (it != nodes.end()) {
-    if (millis() - it->lastSeen > NODE_TIMEOUT) {
+    // Just don't remove ourselves
+    if (millis() - it->lastSeen > NODE_TIMEOUT && it->ip != WiFi.localIP()) {
       Serial.print("Removing node: ");
       Serial.println(it->ip);
       it = nodes.erase(it);
